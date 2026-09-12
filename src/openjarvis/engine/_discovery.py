@@ -12,6 +12,8 @@ from openjarvis.engine._base import InferenceEngine
 
 logger = logging.getLogger(__name__)
 
+_LOCAL_CLI_ENGINES = {"claude_cli", "codex_cli"}
+
 # Map registry keys to config host attribute (None = no host arg)
 _HOST_MAP: Dict[str, str | None] = {
     "ollama": "ollama_host",
@@ -26,6 +28,8 @@ _HOST_MAP: Dict[str, str | None] = {
     "apple_fm": "apple_fm_host",
     "lemonade": "lemonade_host",
     "cloud": None,
+    "claude_cli": None,
+    "codex_cli": None,
     "litellm": None,
     "gemma_cpp": None,
 }
@@ -132,11 +136,17 @@ def discover_engines(config: JarvisConfig) -> List[Tuple[str, InferenceEngine]]:
         return None
 
     healthy: List[Tuple[str, InferenceEngine]] = []
-    if keys:
-        with ThreadPoolExecutor(max_workers=len(keys)) as pool:
-            for result in pool.map(_probe, keys):
+    concurrent_keys = [key for key in keys if key not in _LOCAL_CLI_ENGINES]
+    if concurrent_keys:
+        with ThreadPoolExecutor(max_workers=len(concurrent_keys)) as pool:
+            for result in pool.map(_probe, concurrent_keys):
                 if result is not None:
                     healthy.append(result)
+    for key in keys:
+        if key in _LOCAL_CLI_ENGINES:
+            result = _probe(key)
+            if result is not None:
+                healthy.append(result)
 
     default_key = config.engine.default
 

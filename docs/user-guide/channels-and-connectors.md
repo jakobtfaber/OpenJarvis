@@ -153,6 +153,51 @@ The fastest way is to use the App Manifest — paste this JSON to configure ever
 
 ---
 
+## Apple Mail
+
+**What it indexes:** Messages Mail.app has already cached on this Mac, for **one
+account you choose**. Nothing is fetched from a mail server, no password is
+asked for, and no other account on the Mac is read.
+
+### Setup
+
+1. **Grant Full Disk Access** to the app running OpenJarvis (your terminal, or
+   the desktop app): System Settings → Privacy & Security → Full Disk Access.
+   Apple's local mail store is unreadable without it.
+
+2. **List the accounts Mail has stored locally:**
+   `uv run jarvis connect apple_mail`
+   The table shows each account id, the protocol Mail recorded for it, and which
+   `~/Library/Mail/V*` store it lives in.
+
+3. **Pin the one account to index:**
+   `uv run jarvis connect --account <ACCOUNT-ID> apple_mail`
+   `connect` is a command group, so the option goes before the source name;
+   after it, `--account` is read as a subcommand and the command exits 2.
+   In the desktop/browser UI, the same list appears as a dropdown under
+   Data Sources → Apple Mail.
+
+### Account types
+
+Every account type Mail supports (Exchange, IMAP, POP and On My Mac) writes the
+same `.emlx` files, so all of them are indexed the same way. The protocol shown
+in the account table is informational only.
+The account id you pick must already exist in the local store: an id that
+is not there is rejected at connect time rather than silently syncing zero
+messages. An account that Mail has never downloaded locally (for example, one
+configured to keep nothing on this Mac) has nothing for the connector to read.
+
+### Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| "No local Apple Mail accounts found" | Open Mail.app at least once, then grant Full Disk Access to the app running OpenJarvis |
+| "Unknown Apple Mail account" | Run `jarvis connect apple_mail` with no `--account` and copy an id from the table |
+| Account listed but 0 messages | Mail has the account registered but has not cached messages locally; open that mailbox in Mail.app once |
+| Only getting recent emails | The 500 most recent messages are synced by default (`max_messages`) |
+
+---
+
 ## Google Drive
 
 **What it indexes:** Documents, Sheets, PDFs, and other files from your Drive.

@@ -124,6 +124,37 @@ class TestDiscoverEngines:
         # Wall-time is well under the serial sum (n*sleep), allowing slack.
         assert elapsed < n_engines * sleep_s * 0.7
 
+    def test_subscription_cli_health_checks_run_serially(self) -> None:
+        import threading
+
+        main_thread = threading.get_ident()
+        probe_threads: dict[str, int] = {}
+
+        class _RecordingEngine(_FakeEngine):
+            def __init__(self, key: str) -> None:
+                super().__init__()
+                self._key = key
+
+            def health(self) -> bool:
+                probe_threads[self._key] = threading.get_ident()
+                return True
+
+        keys = ["codex_cli", "claude_cli", "network_a", "network_b"]
+        cfg = JarvisConfig()
+        with (
+            mock.patch.object(EngineRegistry, "keys", return_value=keys),
+            mock.patch(
+                "openjarvis.engine._discovery._make_engine",
+                side_effect=lambda key, config: _RecordingEngine(key),
+            ),
+        ):
+            discover_engines(cfg)
+
+        assert probe_threads["codex_cli"] == main_thread
+        assert probe_threads["claude_cli"] == main_thread
+        assert probe_threads["network_a"] != main_thread
+        assert probe_threads["network_b"] != main_thread
+
 
 class TestDiscoverModels:
     def test_aggregate_models(self) -> None:

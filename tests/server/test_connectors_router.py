@@ -439,6 +439,221 @@ def test_disconnect_preserves_source_owned_by_connected_peer(app) -> None:
         _instances.pop("gmail_imap", None)
 
 
+class _SharedSourceConnector:
+    """A connector that writes a source another connector also owns."""
+
+    def __init__(
+        self,
+        connector_id,
+        indexed_sources=(),
+        revoke_error=None,
+        probe_error=None,
+        connected=True,
+    ):
+        from openjarvis.connectors._stubs import SyncStatus
+
+        self._status = SyncStatus
+        self.connector_id = connector_id
+        self.indexed_sources = indexed_sources
+        self.revoke_error = revoke_error
+        self.probe_error = probe_error
+        self.connected = connected
+
+    def is_connected(self):
+        if self.probe_error is not None:
+            raise self.probe_error
+        return self.connected
+
+    def disconnect(self):
+        if self.revoke_error is not None:
+            raise self.revoke_error
+        self.connected = False
+
+    def sync_status(self):
+        return self._status()
+
+
+def test_disconnect_reports_the_source_it_kept_for_a_connected_peer(app) -> None:
+    """Retention is right, and the response has to admit it happened.
+
+    Both Gmail connectors write ``source='gmail'``, so disconnecting one leaves
+    every row indexed for the other. A body that did not distinguish this from
+    a full purge would let the CLI tell the user content is gone while it is
+    still searchable.
+    """
+    from openjarvis.connectors.store import KnowledgeStore
+    from openjarvis.server.connectors_router import _instances
+
+    _instances["gmail"] = _SharedSourceConnector("gmail")
+    _instances["gmail_imap"] = _SharedSourceConnector("gmail_imap", ("gmail",))
+    try:
+        with KnowledgeStore() as store:
+            store.store(
+                content="shared gmail retention reporting sentinel",
+                source="gmail",
+                doc_type="email",
+                doc_id="gmail:retention-report",
+            )
+
+        response = app.post("/v1/connectors/gmail_imap/disconnect")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "disconnected"
+        assert body["retained_sources"] == ["gmail"]
+        assert body["purged_sources"] == []
+
+        with KnowledgeStore() as store:
+            assert any(
+                result.metadata.get("doc_id") == "gmail:retention-report"
+                for result in store.retrieve("retention reporting sentinel", top_k=10)
+            )
+            store.delete_by_source("gmail")
+    finally:
+        _instances.pop("gmail", None)
+        _instances.pop("gmail_imap", None)
+
+
+def test_a_failed_revoke_does_not_claim_a_purge_that_retention_prevented(app) -> None:
+    """The two shortfalls can land together, and the detail must carry both.
+
+    The binding survived the failure and the shared source was never in the
+    purge set. "Indexed content was purged" is false on both counts, so the
+    detail names what stayed instead.
+    """
+    from openjarvis.connectors.store import KnowledgeStore
+    from openjarvis.server.connectors_router import _instances
+
+    _instances["gmail"] = _SharedSourceConnector("gmail")
+    _instances["gmail_imap"] = _SharedSourceConnector(
+        "gmail_imap", ("gmail",), revoke_error=OSError("permission denied")
+    )
+    try:
+        with KnowledgeStore() as store:
+            store.store(
+                content="shared gmail failed revoke sentinel",
+                source="gmail",
+                doc_type="email",
+                doc_id="gmail:failed-revoke",
+            )
+
+        response = app.post("/v1/connectors/gmail_imap/disconnect")
+        assert response.status_code == 500
+        body = response.json()
+        assert body["code"] == "revoke_failed"
+        assert body["connected"] is True
+        assert body["retained_sources"] == ["gmail"]
+        assert body["purged_sources"] == []
+        detail = body["detail"]
+        assert "gmail stayed indexed because ownership may be shared" in detail
+        assert "permission denied" in detail
+        assert "Indexed content was purged but" not in detail
+        assert "connected owner" not in detail
+
+        with KnowledgeStore() as store:
+            assert any(
+                result.metadata.get("doc_id") == "gmail:failed-revoke"
+                for result in store.retrieve("failed revoke sentinel", top_k=10)
+            )
+            store.delete_by_source("gmail")
+    finally:
+        _instances.pop("gmail", None)
+        _instances.pop("gmail_imap", None)
+
+
+def test_retention_on_an_unreadable_probe_claims_no_connected_owner(app) -> None:
+    """Retaining on a failed probe is right, and the wording has to fit it.
+
+    The ownership filter also retains a shared source when the peer's
+    ``is_connected()`` raises, which is the safe call: unreadable ownership is
+    not proof that nothing else needs the rows. Here the peer is disconnected
+    and its probe raises, so no connected owner exists at all. A response
+    asserting one would be false, and the retained rows still have to survive.
+    """
+    from openjarvis.connectors.store import KnowledgeStore
+    from openjarvis.server.connectors_router import _instances
+
+    _instances["gmail"] = _SharedSourceConnector(
+        "gmail", connected=False, probe_error=OSError("keychain unavailable")
+    )
+    _instances["gmail_imap"] = _SharedSourceConnector("gmail_imap", ("gmail",))
+    try:
+        with KnowledgeStore() as store:
+            store.store(
+                content="shared gmail unreadable probe sentinel",
+                source="gmail",
+                doc_type="email",
+                doc_id="gmail:unreadable-probe",
+            )
+
+        response = app.post("/v1/connectors/gmail_imap/disconnect")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "disconnected"
+        assert body["retained_sources"] == ["gmail"]
+        assert body["purged_sources"] == []
+
+        with KnowledgeStore() as store:
+            assert any(
+                result.metadata.get("doc_id") == "gmail:unreadable-probe"
+                for result in store.retrieve("unreadable probe sentinel", top_k=10)
+            )
+            store.delete_by_source("gmail")
+    finally:
+        _instances.pop("gmail", None)
+        _instances.pop("gmail_imap", None)
+
+
+def test_a_failed_revoke_after_an_unreadable_probe_states_only_shared_ownership(
+    app,
+) -> None:
+    """Both failures at once, with ownership that was never established.
+
+    The binding survived, the shared source was retained on an unreadable
+    probe, and no peer is connected. The detail may say ownership might be
+    shared; it may not say another owner is connected.
+    """
+    from openjarvis.connectors.store import KnowledgeStore
+    from openjarvis.server.connectors_router import _instances
+
+    _instances["gmail"] = _SharedSourceConnector(
+        "gmail", connected=False, probe_error=OSError("keychain unavailable")
+    )
+    _instances["gmail_imap"] = _SharedSourceConnector(
+        "gmail_imap", ("gmail",), revoke_error=OSError("permission denied")
+    )
+    try:
+        with KnowledgeStore() as store:
+            store.store(
+                content="shared gmail unreadable probe revoke sentinel",
+                source="gmail",
+                doc_type="email",
+                doc_id="gmail:unreadable-probe-revoke",
+            )
+
+        response = app.post("/v1/connectors/gmail_imap/disconnect")
+        assert response.status_code == 500
+        body = response.json()
+        assert body["code"] == "revoke_failed"
+        assert body["connected"] is True
+        assert body["retained_sources"] == ["gmail"]
+        assert body["purged_sources"] == []
+        detail = body["detail"]
+        assert "gmail stayed indexed because ownership may be shared" in detail
+        assert "permission denied" in detail
+        assert "connected owner" not in detail
+        assert "Indexed content was purged but" not in detail
+
+        with KnowledgeStore() as store:
+            assert any(
+                result.metadata.get("doc_id") == "gmail:unreadable-probe-revoke"
+                for result in store.retrieve("unreadable probe revoke", top_k=10)
+            )
+            store.delete_by_source("gmail")
+    finally:
+        _instances.pop("gmail", None)
+        _instances.pop("gmail_imap", None)
+
+
 def test_disconnect_restores_checkpoint_when_purge_fails(app, monkeypatch) -> None:
     from openjarvis.connectors.pipeline import IngestionPipeline
     from openjarvis.connectors.store import KnowledgeStore
@@ -707,3 +922,480 @@ def test_connect_news_rss_requires_and_persists_feeds(app, tmp_path: Path) -> No
         ]
     finally:
         _instances.pop("news_rss", None)
+
+
+def _apple_mail_store(tmp_path: Path, account_id: str = "ACCOUNT-ID") -> Path:
+    """Build a throwaway Apple Mail store so no live mailbox is ever read."""
+    import sqlite3
+
+    version = tmp_path / "Mail" / "V10"
+    (version / account_id / "Inbox.mbox" / "Data" / "Messages").mkdir(parents=True)
+    db = version / "MailData" / "Envelope Index"
+    db.parent.mkdir(exist_ok=True)
+    with sqlite3.connect(db) as conn:
+        conn.executescript(
+            "CREATE TABLE mailboxes (ROWID INTEGER PRIMARY KEY, url TEXT);"
+            "CREATE TABLE messages (ROWID INTEGER PRIMARY KEY, mailbox INTEGER, "
+            "deleted INTEGER, date_received INTEGER);"
+            f"INSERT INTO mailboxes VALUES (1, 'imap://{account_id}/Inbox');"
+        )
+    return tmp_path / "Mail"
+
+
+def test_apple_mail_detail_advertises_the_local_accounts(app, tmp_path: Path) -> None:
+    """The UI cannot build a connect request without the account choices."""
+    from openjarvis.connectors.apple_mail import AppleMailConnector
+    from openjarvis.server.connectors_router import _instances
+
+    root = _apple_mail_store(tmp_path)
+    _instances["apple_mail"] = AppleMailConnector(
+        str(tmp_path / "apple_mail.json"), str(root)
+    )
+    try:
+        resp = app.get("/v1/connectors/apple_mail")
+        assert resp.status_code == 200
+        assert resp.json()["setup_options"] == {
+            "accounts": [
+                {
+                    "account_id": "ACCOUNT-ID",
+                    "protocol": "imap",
+                    "mail_version": "V10",
+                }
+            ]
+        }
+    finally:
+        _instances.pop("apple_mail", None)
+
+
+def test_connect_apple_mail_requires_a_known_account(app, tmp_path: Path) -> None:
+    """Neither a missing nor an unknown account may silently sync nothing."""
+    from openjarvis.connectors.apple_mail import AppleMailConnector
+    from openjarvis.server.connectors_router import _instances
+
+    root = _apple_mail_store(tmp_path)
+    config = tmp_path / "apple_mail.json"
+    _instances["apple_mail"] = AppleMailConnector(str(config), str(root))
+    try:
+        assert app.post("/v1/connectors/apple_mail/connect", json={}).status_code == 400
+        resp = app.post(
+            "/v1/connectors/apple_mail/connect",
+            json={"config": {"account_id": "MISSING-ACCOUNT"}},
+        )
+        assert resp.status_code == 400
+        assert "MISSING-ACCOUNT" in resp.json()["detail"]
+        assert not config.exists()
+    finally:
+        _instances.pop("apple_mail", None)
+
+
+def _apple_mail_accounts(
+    tmp_path: Path,
+    messages: tuple[tuple[str, str, str, str], ...],
+) -> Path:
+    """Build a throwaway multi-account Apple Mail store.
+
+    Each entry is ``(account_id, row_id, subject, date_header)``. Nothing here
+    touches a live mailbox; the store is a temporary SQLite index plus one
+    ``.emlx`` file per message.
+    """
+    import sqlite3
+    from email.message import EmailMessage
+
+    root = tmp_path / "Mail"
+    version = root / "V10"
+    db = version / "MailData" / "Envelope Index"
+    db.parent.mkdir(parents=True)
+    with sqlite3.connect(db) as conn:
+        conn.executescript(
+            "CREATE TABLE mailboxes (ROWID INTEGER PRIMARY KEY, url TEXT);"
+            "CREATE TABLE messages (ROWID INTEGER PRIMARY KEY, mailbox INTEGER, "
+            "deleted INTEGER, date_received INTEGER);"
+        )
+        mailboxes: dict[str, int] = {}
+        for account_id, row_id, subject, date_header in messages:
+            if account_id not in mailboxes:
+                mailboxes[account_id] = len(mailboxes) + 1
+                conn.execute(
+                    "INSERT INTO mailboxes VALUES (?, ?)",
+                    (mailboxes[account_id], f"imap://{account_id}/Inbox"),
+                )
+            conn.execute(
+                "INSERT INTO messages VALUES (?, ?, 0, ?)",
+                (int(row_id), mailboxes[account_id], int(row_id)),
+            )
+            msg = EmailMessage()
+            msg["Message-ID"] = f"<{row_id}@example.test>"
+            msg["Subject"] = subject
+            msg["From"] = "sender@example.test"
+            msg["To"] = "recipient@example.test"
+            msg["Date"] = date_header
+            msg.set_content(subject)
+            raw = msg.as_bytes()
+            folder = version / account_id / "Inbox.mbox" / "Data" / "Messages"
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / f"{row_id}.emlx").write_bytes(
+                str(len(raw)).encode() + b"\n" + raw
+            )
+    return root
+
+
+# Account A's mail is newer than account B's, which is what makes an inherited
+# watermark visible: a ``since`` filter left at A's completion time skips every
+# one of B's messages, and the backfill reports a clean zero-document sync.
+_ACCOUNT_A_SUBJECT = "alpha account mail"
+_ACCOUNT_B_SUBJECT = "bravo account mail"
+_ACCOUNT_A_MESSAGE = (
+    "ACCOUNT-A",
+    "41",
+    _ACCOUNT_A_SUBJECT,
+    "Wed, 10 Sep 2025 12:00:00 +0000",
+)
+_ACCOUNT_B_MESSAGE = (
+    "ACCOUNT-B",
+    "42",
+    _ACCOUNT_B_SUBJECT,
+    "Sun, 05 Jan 2025 12:00:00 +0000",
+)
+
+
+def _apple_mail_doc_ids() -> set[str]:
+    """Return the doc ids the knowledge store holds for the two test accounts.
+
+    The subjects are plain words on purpose: the store searches over an FTS5
+    index, where a hyphenated term parses as an operator rather than as text
+    and matches nothing.
+    """
+    from openjarvis.connectors.store import KnowledgeStore
+
+    found = set()
+    with KnowledgeStore() as store:
+        for subject in (_ACCOUNT_A_SUBJECT, _ACCOUNT_B_SUBJECT):
+            for result in store.retrieve(subject, top_k=20, source="apple_mail"):
+                doc_id = str(result.metadata.get("doc_id", ""))
+                if doc_id:
+                    found.add(doc_id)
+    return found
+
+
+def _apple_mail_checkpoint() -> dict | None:
+    from openjarvis.connectors.pipeline import IngestionPipeline
+    from openjarvis.connectors.store import KnowledgeStore
+    from openjarvis.connectors.sync_engine import SyncEngine
+
+    with KnowledgeStore() as store:
+        with SyncEngine(pipeline=IngestionPipeline(store=store)) as engine:
+            return engine.get_checkpoint("apple_mail")
+
+
+def _await_apple_mail_sync(app, timeout: float = 10.0) -> dict:
+    """Block until the background sync worker has stopped writing.
+
+    The worker's thread lives in the router's closure, so the polling endpoint
+    the UI uses is also the only handle a test has on it.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        state = app.get("/v1/connectors/apple_mail/sync").json()
+        if state["state"] not in {"syncing", "stopping"}:
+            return state
+        time.sleep(0.01)
+    pytest.fail("the apple_mail sync worker never stopped")
+
+
+def _disconnect_when_the_worker_stops(app, timeout: float = 10.0):
+    """Retry the disconnect until the worker it is waiting on has stopped.
+
+    A refused disconnect deliberately leaves the connector marked as stopping:
+    its worker still owns the store, and the caller is told to retry. Retrying
+    is therefore both the documented way out and the only signal a test has
+    that the join finally succeeded.
+    """
+    deadline = time.time() + timeout
+    while True:
+        response = app.post("/v1/connectors/apple_mail/disconnect")
+        if response.status_code != 409 or time.time() >= deadline:
+            return response
+        time.sleep(0.01)
+
+
+@pytest.fixture
+def apple_mail_account_a(tmp_path: Path):
+    """An Apple Mail connector pinned to account A, with A's mail indexed."""
+    from openjarvis.connectors.apple_mail import AppleMailConnector
+    from openjarvis.connectors.store import KnowledgeStore
+    from openjarvis.server.connectors_router import _instances
+
+    root = _apple_mail_accounts(tmp_path, (_ACCOUNT_A_MESSAGE, _ACCOUNT_B_MESSAGE))
+    config = tmp_path / "apple_mail.json"
+    connector = AppleMailConnector(str(config), str(root))
+    _instances["apple_mail"] = connector
+    try:
+        with KnowledgeStore() as store:
+            store.delete_by_sources({"apple_mail"})
+        _reset_apple_mail_checkpoint()
+        yield connector, config
+    finally:
+        _instances.pop("apple_mail", None)
+        with KnowledgeStore() as store:
+            store.delete_by_sources({"apple_mail"})
+        _reset_apple_mail_checkpoint()
+
+
+def _reset_apple_mail_checkpoint() -> None:
+    from openjarvis.connectors.pipeline import IngestionPipeline
+    from openjarvis.connectors.store import KnowledgeStore
+    from openjarvis.connectors.sync_engine import SyncEngine
+
+    with KnowledgeStore() as store:
+        with SyncEngine(pipeline=IngestionPipeline(store=store)) as engine:
+            engine.reset_checkpoint("apple_mail")
+
+
+def test_disconnect_keeps_the_account_bound_when_the_purge_fails(
+    app,
+    monkeypatch,
+    tmp_path: Path,
+    apple_mail_account_a,
+) -> None:
+    """A failed cleanup must not clear the binding that blocks a repin.
+
+    Revoking credentials first would drop the account id ``configure()``
+    compares against, so the caller would see the failure and then be allowed
+    to connect a different account on top of the old account's surviving mail.
+    """
+    from openjarvis.connectors.apple_mail import AppleMailConnector
+    from openjarvis.connectors.store import KnowledgeStore
+
+    connector, config = apple_mail_account_a
+    assert (
+        app.post(
+            "/v1/connectors/apple_mail/connect",
+            json={"config": {"account_id": "ACCOUNT-A"}},
+        ).status_code
+        == 200
+    )
+    _await_apple_mail_sync(app)
+    assert _apple_mail_doc_ids() == {"apple_mail:ACCOUNT-A:<41@example.test>"}
+    before = _apple_mail_checkpoint()
+    assert before is not None and before["last_sync"]
+
+    def _locked(self, sources):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(KnowledgeStore, "delete_by_sources", _locked)
+
+    resp = app.post("/v1/connectors/apple_mail/disconnect")
+    assert resp.status_code == 500
+    body = resp.json()
+    assert body["code"] == "cleanup_failed"
+    assert body["connected"] is True
+    assert "still connected" in body["detail"]
+    # Nothing was deleted, so nothing may be reported as purged.
+    assert body["purged_sources"] == []
+    assert body["retained_sources"] == ["apple_mail"]
+
+    monkeypatch.undo()
+
+    # The binding survived, so A's surviving mail cannot be shadowed by B.
+    assert json.loads(config.read_text())["account_id"] == "ACCOUNT-A"
+    assert connector.is_connected()
+    assert _apple_mail_doc_ids() == {"apple_mail:ACCOUNT-A:<41@example.test>"}
+
+    # The whole checkpoint came back, not only the fields the purge reads. A
+    # partially restored one would let the next sync re-read or skip A's mail.
+    assert _apple_mail_checkpoint() == before
+
+    repin = app.post(
+        "/v1/connectors/apple_mail/connect",
+        json={"config": {"account_id": "ACCOUNT-B"}},
+    )
+    assert repin.status_code == 409
+    assert "retry disconnect before reconnecting" in repin.json()["detail"]
+    assert json.loads(config.read_text())["account_id"] == "ACCOUNT-A"
+
+    # That refusal is in-memory, so it dies with the process. The binding is
+    # what survives a restart, and it has to keep refusing on its own. A
+    # connector built from scratch over the same config is what the next
+    # process sees.
+    restarted = AppleMailConnector(str(config), str(tmp_path / "Mail"))
+    assert restarted.is_connected()
+    with pytest.raises(ValueError, match="already connected to account 'ACCOUNT-A'"):
+        restarted.configure("ACCOUNT-B")
+    with pytest.raises(ValueError, match="already connected to account 'ACCOUNT-A'"):
+        connector.configure("ACCOUNT-B")
+    assert json.loads(config.read_text())["account_id"] == "ACCOUNT-A"
+
+    # The shortfall is recoverable: once the store is writable the retry
+    # completes, and B then backfills its own older mail from nothing.
+    assert app.post("/v1/connectors/apple_mail/disconnect").status_code == 200
+    assert not config.exists()
+    assert _apple_mail_doc_ids() == set()
+    assert (
+        app.post(
+            "/v1/connectors/apple_mail/connect",
+            json={"config": {"account_id": "ACCOUNT-B"}},
+        ).status_code
+        == 200
+    )
+    _await_apple_mail_sync(app)
+    assert _apple_mail_doc_ids() == {"apple_mail:ACCOUNT-B:<42@example.test>"}
+
+
+def test_disconnect_reports_a_failed_revoke_without_claiming_the_content_survived(
+    app,
+    monkeypatch,
+    apple_mail_account_a,
+) -> None:
+    """Past the purge the content is gone, and the report has to say so.
+
+    This is the deliberate fail-closed shortfall: the account stays bound and
+    the repin stays refused until a retry releases it. What the endpoint must
+    not do is describe the content as preserved, because it is not.
+    """
+    connector, config = apple_mail_account_a
+    assert (
+        app.post(
+            "/v1/connectors/apple_mail/connect",
+            json={"config": {"account_id": "ACCOUNT-A"}},
+        ).status_code
+        == 200
+    )
+    _await_apple_mail_sync(app)
+    assert _apple_mail_doc_ids() == {"apple_mail:ACCOUNT-A:<41@example.test>"}
+
+    def _refused(*args, **kwargs):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(connector, "disconnect", _refused)
+
+    resp = app.post("/v1/connectors/apple_mail/disconnect")
+    assert resp.status_code == 500
+    body = resp.json()
+    assert body["code"] == "revoke_failed"
+    assert "purged" in body["detail"]
+    assert "still connected" not in body["detail"]
+    # Apple Mail owns its source alone, so the purge really was complete.
+    assert body["purged_sources"] == ["apple_mail"]
+    assert body["retained_sources"] == []
+
+    monkeypatch.undo()
+
+    # Content gone, binding retained: the repin guard is still the one in force.
+    assert _apple_mail_doc_ids() == set()
+    assert json.loads(config.read_text())["account_id"] == "ACCOUNT-A"
+    assert connector.is_connected()
+    repin = app.post(
+        "/v1/connectors/apple_mail/connect",
+        json={"config": {"account_id": "ACCOUNT-B"}},
+    )
+    assert repin.status_code == 409
+    assert json.loads(config.read_text())["account_id"] == "ACCOUNT-A"
+    with pytest.raises(ValueError, match="already connected to account 'ACCOUNT-A'"):
+        connector.configure("ACCOUNT-B")
+
+    # A retry releases the binding, and B starts from an empty store.
+    assert app.post("/v1/connectors/apple_mail/disconnect").status_code == 200
+    assert not config.exists()
+    assert (
+        app.post(
+            "/v1/connectors/apple_mail/connect",
+            json={"config": {"account_id": "ACCOUNT-B"}},
+        ).status_code
+        == 200
+    )
+    _await_apple_mail_sync(app)
+    assert _apple_mail_doc_ids() == {"apple_mail:ACCOUNT-B:<42@example.test>"}
+
+
+def test_disconnect_refuses_while_a_paused_worker_still_owns_the_account(
+    app,
+    monkeypatch,
+    apple_mail_account_a,
+) -> None:
+    """A sync paused after capturing a message still owns the store.
+
+    Purging around it -- which is what a second process doing its own cleanup
+    would do -- lets the worker resume into a store that has already been
+    handed to the next account.
+    """
+    from openjarvis.server import connectors_router
+
+    connector, config = apple_mail_account_a
+    connector.configure("ACCOUNT-A")
+
+    captured = threading.Event()
+    released = threading.Event()
+    real_sync = connector.sync
+
+    def gated_sync(**kwargs):
+        for document in real_sync(**kwargs):
+            yield document
+            captured.set()
+            released.wait(timeout=5)
+
+    monkeypatch.setattr(connector, "sync", gated_sync)
+    monkeypatch.setattr(connectors_router, "_SYNC_STOP_TIMEOUT_SECONDS", 0.05)
+
+    try:
+        assert app.post("/v1/connectors/apple_mail/sync").status_code == 200
+        assert captured.wait(timeout=5)
+
+        resp = app.post("/v1/connectors/apple_mail/disconnect")
+        assert resp.status_code == 409
+        assert "was not purged" in resp.json()["detail"]
+        # Nothing was revoked, so the repin guard is still the one in force.
+        assert json.loads(config.read_text())["account_id"] == "ACCOUNT-A"
+
+        repin = app.post(
+            "/v1/connectors/apple_mail/connect",
+            json={"config": {"account_id": "ACCOUNT-B"}},
+        )
+        assert repin.status_code == 409
+        assert json.loads(config.read_text())["account_id"] == "ACCOUNT-A"
+    finally:
+        released.set()
+
+    # Only once the worker has stopped does the purge run, and the account that
+    # follows starts from nothing rather than from A's leftovers.
+    assert _disconnect_when_the_worker_stops(app).status_code == 200
+    assert not config.exists()
+    assert _apple_mail_doc_ids() == set()
+
+
+def test_a_reconnected_account_never_inherits_the_previous_watermark(
+    app,
+    apple_mail_account_a,
+) -> None:
+    """B's backfill must re-read from the start, not from A's last sync.
+
+    B's mail is older than A's, so a surviving ``last_sync`` would filter every
+    message of B's out and report a successful, empty first sync.
+    """
+    connector, config = apple_mail_account_a
+
+    assert (
+        app.post(
+            "/v1/connectors/apple_mail/connect",
+            json={"config": {"account_id": "ACCOUNT-A"}},
+        ).status_code
+        == 200
+    )
+    _await_apple_mail_sync(app)
+    assert _apple_mail_checkpoint()["last_sync"] is not None
+
+    assert app.post("/v1/connectors/apple_mail/disconnect").status_code == 200
+    assert not config.exists()
+    assert _apple_mail_doc_ids() == set()
+    checkpoint = _apple_mail_checkpoint()
+    assert checkpoint is None or checkpoint["last_sync"] is None
+
+    assert (
+        app.post(
+            "/v1/connectors/apple_mail/connect",
+            json={"config": {"account_id": "ACCOUNT-B"}},
+        ).status_code
+        == 200
+    )
+    _await_apple_mail_sync(app)
+
+    assert _apple_mail_doc_ids() == {"apple_mail:ACCOUNT-B:<42@example.test>"}
