@@ -78,6 +78,58 @@ against fat fingers, not as a security boundary.
 
 ---
 
+## CLI inference backends
+
+The `claude_cli` and `codex_cli` engines answer prompts by running a coding CLI
+as a child process. That child is a separate program with its own tools, so the
+boundary is whatever the CLI itself enforces, not what OpenJarvis asks it for in
+a prompt. The two CLIs differ, and the difference decides what each engine will
+serve.
+
+Both engines read the same two switches:
+
+| Environment variable | Effect |
+|----------------------|--------|
+| `OPENJARVIS_FILESYSTEM_MODE=read-write` | Opt in to a tool-using turn, scoped to the working directory. |
+| `OPENJARVIS_GITHUB_MODE=read-write` | Adds git and the authenticated `gh` CLI. Requires the filesystem opt-in; on its own it does nothing. |
+
+The working directory is `OPENJARVIS_CLAUDE_CWD` or `OPENJARVIS_CODEX_CWD`,
+falling back to `OPENJARVIS_HOME` and then your home directory.
+
+### `claude_cli`: text-only is enforced
+
+Without the filesystem opt-in the engine passes `--restricted` with an empty
+`--tools` list. The CLI itself then removes the command-running tools and
+confines the file tools to its working directories, and it ignores your user,
+project and local settings files. With the opt-in, `--add-dir` names the
+configured working directory and the file tools are confined to it.
+
+### `codex_cli`: text-only is refused, not enforced
+
+`codex exec` has no flag that removes its tools. A read-only sandbox still lets
+it read every file your user can read, and an event stream is only observed
+after the child has already run, so nothing OpenJarvis inspects afterwards can
+undo a read. Rather than claim a boundary it cannot hold, this engine fails
+closed: without `OPENJARVIS_FILESYSTEM_MODE=read-write` it refuses the turn
+before starting a child, reports `health()` as false, and is not advertised by
+engine discovery. Use `claude_cli` when you want enforced text-only inference.
+
+With the opt-in, the turn runs under `--sandbox workspace-write`, `-C <cwd>`,
+`--ephemeral`, `--ignore-user-config` and `--ignore-rules`.
+
+### What the credential scrub does and does not do
+
+Both engines strip `OPENAI_API_KEY`, `CODEX_API_KEY`, `OPENAI_BASE_URL` and
+their siblings from the child's environment. That exists so a
+subscription-authenticated turn cannot quietly fall back to API-key billing or a
+redirected endpoint. It is a billing and endpoint guard, not a secret boundary.
+The child still inherits the rest of the environment, still runs as your user,
+and (in filesystem mode) still reads anything your user can read.
+`CODEX_HOME` is deliberately left in place, because the subscription credential
+lives there.
+
+---
+
 ## Confirmation behaviour
 
 `shell_exec`, `git_commit` and `agent_kill` are marked `requires_confirmation`.

@@ -10,6 +10,7 @@ import pytest
 
 # All connectors that should be testable without credentials
 _LOCAL_CONNECTORS = [
+    ("apple_mail", "openjarvis.connectors.apple_mail", "AppleMailConnector"),
     ("apple_notes", "openjarvis.connectors.apple_notes", "AppleNotesConnector"),
     ("imessage", "openjarvis.connectors.imessage", "IMessageConnector"),
 ]

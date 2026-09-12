@@ -115,6 +115,7 @@ def create_connectors_router():
     """
     try:
         from fastapi import APIRouter, HTTPException
+        from fastapi.responses import JSONResponse
     except ImportError as exc:
         raise ImportError(
             "fastapi and pydantic are required for the connectors router"
@@ -489,6 +490,19 @@ def create_connectors_router():
         except Exception:
             pass
 
+        # Account-scoped local connectors advertise the choices the UI has to
+        # offer before a connect request can be built. Discovery reads only
+        # local metadata, never message content.
+        setup_options = None
+        if hasattr(instance, "available_accounts"):
+            try:
+                setup_options = {"accounts": instance.available_accounts()}
+            except Exception as exc:  # noqa: BLE001
+                # An unreadable local store is not an empty one: report the
+                # failure so the UI can say why the list is missing instead of
+                # showing "no accounts found" for a permissions problem.
+                setup_options = {"accounts": [], "error": str(exc)}
+
         return {
             "connector_id": connector_id,
             "display_name": getattr(instance, "display_name", connector_id),
@@ -497,6 +511,7 @@ def create_connectors_router():
             "auth_url": auth_url,
             "mcp_tools": mcp_tools,
             "oauth_setup": oauth_setup,
+            "setup_options": setup_options,
         }
 
     @router.post("/{connector_id}/connect")
@@ -608,6 +623,18 @@ def create_connectors_router():
                     )
                 instance.configure(feeds)
 
+            elif connector_id == "apple_mail":
+                account_id = (req.config or {}).get("account_id")
+                if not isinstance(account_id, str) or not account_id.strip():
+                    raise HTTPException(
+                        status_code=400,
+                        detail="An Apple Mail account id is required",
+                    )
+                # configure() rejects an account that is not present in the
+                # local store, so an unknown id fails loudly instead of
+                # syncing zero messages.
+                instance.configure(account_id.strip())
+
             else:
                 # Generic: try to store token or credentials if the instance
                 # exposes the relevant attributes.
@@ -672,20 +699,12 @@ def create_connectors_router():
                 ),
             )
 
-        # Only revoke/delete credentials after the worker has relinquished
-        # the old connection.  A timeout must leave the connector usable and
-        # reject reconnect attempts, rather than silently switching source
-        # state underneath a still-running writer.
-        try:
-            instance.disconnect()
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc))
-
         # A source can be shared by multiple connector implementations
         # (Gmail OAuth and Gmail IMAP both write source='gmail'). Preserve it
         # while another owner is connected; otherwise purge it only after the
         # in-flight writer has stopped.
-        purge_sources = set(_knowledge_sources(connector_id, instance))
+        owned_sources = set(_knowledge_sources(connector_id, instance))
+        purge_sources = set(owned_sources)
         for other_id in ConnectorRegistry.keys():
             if other_id == connector_id:
                 continue
@@ -699,6 +718,14 @@ def create_connectors_router():
             except Exception:
                 # If ownership cannot be established safely, retain data.
                 purge_sources.difference_update(shared)
+
+        # What the caller is told has to match what the purge actually covers.
+        # A retained shared source stays indexed on purpose, so a response that
+        # reports the content gone would be false for exactly the rows another
+        # owner still depends on. Both lists go out with every outcome that got
+        # as far as computing them.
+        retained_sources = sorted(owned_sources - purge_sources)
+        purged_sources = sorted(purge_sources)
 
         try:
             from openjarvis.connectors.pipeline import IngestionPipeline
@@ -718,9 +745,64 @@ def create_connectors_router():
                         raise
         except Exception as exc:  # noqa: BLE001
             logger.exception("Disconnect cleanup failed for %s", connector_id)
-            raise HTTPException(
+            # The rollback above put the checkpoint back, and the delete is a
+            # single transaction, so the caller can be told the content is
+            # still there. ``code`` says so without parsing the message.
+            return JSONResponse(
                 status_code=500,
-                detail=f"Disconnected, but indexed-data cleanup failed: {exc}",
+                content={
+                    "connector_id": connector_id,
+                    "code": "cleanup_failed",
+                    "connected": True,
+                    "purged_sources": [],
+                    "retained_sources": sorted(owned_sources),
+                    "detail": f"Indexed-data cleanup failed, still connected: {exc}",
+                },
+            )
+
+        # Credentials go last, so a failed purge above leaves the connector
+        # bound to the account whose content survived. Revoking first would
+        # drop the binding an account-scoped connector's repin guard depends
+        # on: the caller would see the failure, then be allowed to connect a
+        # different account on top of the old account's indexed mail.
+        try:
+            instance.disconnect()
+        except Exception as exc:
+            # The purge already happened. Saying "still connected" here would
+            # be a false preservation claim, so this failure reports the shape
+            # it actually has: content gone, account still bound, repin still
+            # refused until a retry releases it.
+            logger.exception("Disconnect revoke failed for %s", connector_id)
+            if retained_sources:
+                # Part of this connector's content is still indexed, because
+                # another connector writes the same source. Saying the content
+                # was purged would be false for those rows. A source is also
+                # retained when the peer's connectivity probe raises, so this
+                # states that ownership may be shared rather than that another
+                # owner is connected, which holds for both reasons.
+                purged_claim = (
+                    "Indexed content this connector owned alone was purged, "
+                    "and "
+                    + ", ".join(retained_sources)
+                    + " stayed indexed because ownership may be shared with "
+                    "another integration, but the account binding could not "
+                    "be released"
+                )
+            else:
+                purged_claim = (
+                    "Indexed content was purged but the account binding "
+                    "could not be released"
+                )
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "connector_id": connector_id,
+                    "code": "revoke_failed",
+                    "connected": True,
+                    "purged_sources": purged_sources,
+                    "retained_sources": retained_sources,
+                    "detail": f"{purged_claim}: {exc}",
+                },
             )
 
         with _sync_lock:
@@ -732,6 +814,8 @@ def create_connectors_router():
             "connector_id": connector_id,
             "connected": False,
             "status": "disconnected",
+            "purged_sources": purged_sources,
+            "retained_sources": retained_sources,
         }
 
     @router.get("/{connector_id}/oauth/start")

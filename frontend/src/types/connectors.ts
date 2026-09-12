@@ -32,6 +32,22 @@ export interface OAuthSetupInfo {
   has_credentials: boolean;
 }
 
+/** One locally discovered account an account-scoped connector can be pinned to. */
+export interface LocalAccountOption {
+  account_id: string;
+  protocol: string;
+  mail_version: string;
+}
+
+/** Choices the UI must present before a connect request can be built. Populated
+ *  only for connectors that discover their setup options locally (Apple Mail). */
+export interface ConnectorSetupOptions {
+  accounts: LocalAccountOption[];
+  /** Why discovery returned nothing. Present only when reading the local store
+   *  failed, which is not the same as the store holding no accounts. */
+  error?: string;
+}
+
 export interface ConnectorInfo {
   connector_id: string;
   display_name: string;
@@ -41,6 +57,7 @@ export interface ConnectorInfo {
   mcp_tools?: string[];
   chunks?: number;
   oauth_setup?: OAuthSetupInfo | null;
+  setup_options?: ConnectorSetupOptions | null;
 }
 
 export interface SyncStatus {
@@ -285,6 +302,18 @@ export const SOURCE_CATALOG: ConnectorMeta[] = [
         label: 'Toggle the switch ON next to each app you added. Close and reopen your terminal (or restart OpenJarvis). iMessage data will be detected automatically — no credentials needed',
       },
     ],
+  },
+  {
+    // No `steps`: the account picker lives in GenericConnectPanel, because the
+    // account has to be chosen from what the local store actually contains.
+    connector_id: 'apple_mail',
+    display_name: 'Apple Mail',
+    auth_type: 'local',
+    category: 'communication',
+    icon: 'Mail',
+    color: 'text-blue-300',
+    description: 'Locally cached Mail.app messages, one account',
+    unitLabel: 'emails',
   },
   // ── Documents ──────────────────────────────────────────────────────
   {

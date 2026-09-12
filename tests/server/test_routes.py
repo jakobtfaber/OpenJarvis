@@ -580,6 +580,68 @@ class TestChatCompletions:
         assert finish["telemetry"]["engine"] == "ollama"
         routed_cloud.stream.assert_not_called()
 
+    @pytest.mark.parametrize(
+        ("engine_key", "model"),
+        [("claude_cli", "claude/default"), ("codex_cli", "codex/default")],
+    )
+    def test_cli_engine_models_stream_from_their_own_engine(self, engine_key, model):
+        """A CLI engine reports is_cloud but owns its models.
+
+        Treating ``is_cloud`` alone as a mis-route sent ``codex/default`` to
+        Ollama, which has never heard of it.
+        """
+        from openjarvis.engine.multi import MultiEngine
+
+        class _FakeCLIEngine:
+            engine_id = engine_key
+            is_cloud = True
+
+            def list_models(self):
+                return [model]
+
+            def health(self):
+                return True
+
+            async def stream(self, messages, *, model, temperature, max_tokens):
+                yield "from-the-cli"
+
+        engine = MultiEngine([(engine_key, _FakeCLIEngine())])
+
+        async def local_stream(model, messages, temperature, max_tokens):
+            yield "wrongly-routed-to-ollama"
+
+        app = create_app(engine, model, config=_test_config())
+        with patch(
+            "openjarvis.server.cloud_router.stream_local",
+            side_effect=local_stream,
+        ) as stream_local:
+            resp = TestClient(app).post(
+                "/v1/chat/completions",
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        chunks = [
+            json.loads(line.removeprefix("data: "))
+            for line in resp.text.splitlines()
+            if line.startswith("data: {")
+        ]
+        content = "".join(
+            chunk["choices"][0]["delta"].get("content") or "" for chunk in chunks
+        )
+        finish = next(
+            chunk
+            for chunk in chunks
+            if chunk["choices"][0].get("finish_reason") == "stop"
+        )
+        assert content == "from-the-cli"
+        assert finish["telemetry"]["engine"] == engine_key
+        stream_local.assert_not_called()
+
     def test_streaming_without_client_tools_uses_configured_agent(self):
         """Server-side tools remain available to streaming web clients (#735)."""
         from openjarvis.agents.orchestrator import OrchestratorAgent
@@ -1497,6 +1559,42 @@ class TestModelsEndpoint:
         assert resp.status_code == 200
         assert [item["id"] for item in resp.json()["data"]] == [model]
         assert resp.json()["data"][0]["owned_by"] == "litellm"
+
+    def test_configured_codex_cli_model_is_listed(self):
+        model = "codex/default"
+        engine = _make_engine(models=[model])
+        engine.engine_id = "codex_cli"
+        client = TestClient(
+            create_app(
+                engine,
+                model,
+                engine_name="codex_cli",
+                config=_test_config(),
+            )
+        )
+
+        resp = client.get("/v1/models")
+
+        assert resp.status_code == 200
+        assert [item["id"] for item in resp.json()["data"]] == [model]
+
+    def test_configured_claude_cli_model_is_listed(self):
+        model = "claude/default"
+        engine = _make_engine(models=[model])
+        engine.engine_id = "claude_cli"
+        client = TestClient(
+            create_app(
+                engine,
+                model,
+                engine_name="claude_cli",
+                config=_test_config(),
+            )
+        )
+
+        resp = client.get("/v1/models")
+
+        assert resp.status_code == 200
+        assert [item["id"] for item in resp.json()["data"]] == [model]
 
     def test_litellm_provider_model_streams_through_active_engine(self):
         """A LiteLLM ``provider/model`` ID must not bypass its engine."""

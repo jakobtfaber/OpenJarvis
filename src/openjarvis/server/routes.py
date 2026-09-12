@@ -428,6 +428,12 @@ def _remember_exchange(
     )
 
 
+# Engines that answer through a coding CLI. They report ``is_cloud`` because
+# the inference happens off-box, but they are the configured owner of their own
+# models: no local Ollama fallback can serve ``claude/…`` or ``codex/…``.
+_CLI_ENGINE_KEYS = frozenset({"claude_cli", "codex_cli"})
+
+
 def _engine_key_for_model(engine: Any, model: str) -> str | None:
     """Resolve the engine that advertised *model* through wrapper layers."""
     from openjarvis.engine.multi import MultiEngine
@@ -449,11 +455,41 @@ def _engine_key_for_model(engine: Any, model: str) -> str | None:
     return None
 
 
+def _routed_engine_for_model(engine: Any, model: str) -> Any | None:
+    """Return the engine a MultiEngine would route *model* to, through wrappers.
+
+    ``None`` when no MultiEngine is in the chain, i.e. when nothing can
+    mis-route the request in the first place.
+    """
+    from openjarvis.engine.multi import MultiEngine
+    from openjarvis.security.guardrails import GuardrailsEngine
+    from openjarvis.telemetry.instrumented_engine import InstrumentedEngine
+
+    current = engine
+    while current is not None:
+        if isinstance(current, MultiEngine):
+            try:
+                return current._engine_for(model)
+            except Exception:
+                return None
+        if isinstance(current, InstrumentedEngine):
+            current = current._inner
+            continue
+        if isinstance(current, GuardrailsEngine):
+            current = current._engine
+            continue
+        return None
+    return None
+
+
 def _uses_direct_cloud_router(engine: Any, model: str) -> bool:
     """Whether *model* should bypass the configured engine for direct cloud."""
     from openjarvis.server.cloud_router import is_cloud_model
 
-    return is_cloud_model(model) and _engine_key_for_model(engine, model) != "litellm"
+    return is_cloud_model(model) and _engine_key_for_model(engine, model) not in {
+        *_CLI_ENGINE_KEYS,
+        "litellm",
+    }
 
 
 def _handle_direct(
@@ -986,13 +1022,14 @@ async def _handle_stream(
                 # accidentally matched.
                 _use_local_fallback = False
                 try:
-                    from openjarvis.engine.multi import MultiEngine
-
-                    _inner = getattr(engine, "_inner", engine)
-                    if isinstance(_inner, MultiEngine):
-                        _routed = _inner._engine_for(model)
-                        if _routed is not None and getattr(_routed, "is_cloud", False):
-                            _use_local_fallback = True
+                    _routed = _routed_engine_for_model(engine, model)
+                    if _routed is not None and getattr(_routed, "is_cloud", False):
+                        # A CLI engine is cloud-backed but owns its own models;
+                        # only a genuine mis-route — a local model landing on a
+                        # cloud backend — may fall back to Ollama.
+                        _use_local_fallback = (
+                            _engine_key_for_model(engine, model) not in _CLI_ENGINE_KEYS
+                        )
                 except Exception:
                     pass
                 if _use_local_fallback:
@@ -1115,14 +1152,15 @@ async def list_models(request: Request) -> ModelListResponse:
 
     # Prefer engine.list_models() so mock engines work in tests.
     # Filter out direct-cloud model IDs that may appear via MultiEngine, but
-    # retain provider-qualified IDs owned by the configured LiteLLM engine.
+    # retain provider-qualified IDs owned by configured routing engines.
     # Fall back to direct Ollama query only when the engine returns nothing.
     engine = request.app.state.engine
     all_ids = await asyncio.to_thread(engine.list_models)
     model_ids = [
         m
         for m in all_ids
-        if not is_cloud_model(m) or _engine_key_for_model(engine, m) == "litellm"
+        if not is_cloud_model(m)
+        or _engine_key_for_model(engine, m) in {*_CLI_ENGINE_KEYS, "litellm"}
     ]
     if not model_ids:
         model_ids = await list_local_models()

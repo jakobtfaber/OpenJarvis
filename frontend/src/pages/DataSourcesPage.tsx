@@ -23,7 +23,7 @@ import {
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { SOURCE_CATALOG } from '../types/connectors';
-import type { ConnectRequest, ConnectorMeta, SyncStatus, OAuthSetupInfo } from '../types/connectors';
+import type { ConnectRequest, ConnectorMeta, SyncStatus, OAuthSetupInfo, LocalAccountOption } from '../types/connectors';
 import { listConnectors, connectSource, disconnectSourceUntilComplete, getConnector, getSyncStatus, triggerSync, startServerOAuth } from '../lib/connectors-api';
 
 // ---------------------------------------------------------------------------
@@ -143,6 +143,43 @@ function InlineConnectForm({
 // entries already use (InlineConnectForm, oauth start+poll).
 // ---------------------------------------------------------------------------
 
+/**
+ * Guidance and readiness for an account-scoped local connector.
+ *
+ * Split out of the panel so the three states (still discovering, none found,
+ * and a real choice) can be asserted without a DOM. `ready` gates the connect
+ * button: the backend rejects a request with no account id, so the UI must
+ * never send one.
+ */
+export function localAccountPickerState(
+  displayName: string,
+  accounts: LocalAccountOption[] | null,
+  accountId: string,
+  discoveryError = '',
+): { hint: string; ready: boolean } {
+  if (accounts === null) {
+    return { hint: `Looking for ${displayName} accounts on this Mac...`, ready: false };
+  }
+  if (discoveryError) {
+    // An unreadable store is a different problem from an empty one, so the
+    // Full Disk Access advice below would send the user down the wrong path.
+    return {
+      hint: `Could not read the local ${displayName} store: ${discoveryError}`,
+      ready: false,
+    };
+  }
+  if (accounts.length === 0) {
+    return {
+      hint: `No ${displayName} accounts found. Open Mail.app at least once, and grant OpenJarvis Full Disk Access under System Settings → Privacy & Security.`,
+      ready: false,
+    };
+  }
+  return {
+    hint: `Choose one account. ${displayName} is indexed read-only from the local message store; other accounts are never read.`,
+    ready: accountId !== '',
+  };
+}
+
 function GenericConnectPanel({
   connectorId,
   displayName,
@@ -162,21 +199,71 @@ function GenericConnectPanel({
 }) {
   const [oauthSetup, setOauthSetup] = useState<OAuthSetupInfo | null>(null);
   const [feedUrls, setFeedUrls] = useState('');
+  // Account-scoped local connectors: the backend discovers the accounts that
+  // actually exist on this Mac, so the picker cannot be a static catalog step.
+  const [accounts, setAccounts] = useState<LocalAccountOption[] | null>(null);
+  const [accountError, setAccountError] = useState('');
+  const [accountId, setAccountId] = useState('');
+  const needsAccount = connectorId === 'apple_mail';
 
   useEffect(() => {
-    if (authType !== 'oauth') return;
+    if (authType !== 'oauth' && !needsAccount) return;
     let cancelled = false;
     getConnector(connectorId)
       .then((info) => {
-        if (!cancelled) setOauthSetup(info.oauth_setup ?? null);
+        if (cancelled) return;
+        setOauthSetup(info.oauth_setup ?? null);
+        if (needsAccount) {
+          const found = info.setup_options?.accounts ?? [];
+          setAccounts(found);
+          setAccountError(info.setup_options?.error ?? '');
+          setAccountId((current) => current || found[0]?.account_id || '');
+        }
       })
-      .catch(() => {});
+      .catch(() => {
+        if (!cancelled && needsAccount) setAccounts([]);
+      });
     return () => {
       cancelled = true;
     };
-  }, [connectorId, authType]);
+  }, [connectorId, authType, needsAccount]);
 
   if (authType === 'local') {
+    if (needsAccount) {
+      const { hint, ready } = localAccountPickerState(
+        displayName,
+        accounts,
+        accountId,
+        accountError,
+      );
+      return (
+        <div>
+          <div style={{ fontSize: 12, color: 'var(--color-text-secondary)', marginBottom: 10 }}>
+            {hint}
+          </div>
+          {accounts !== null && accounts.length > 0 && (
+            <select
+              value={accountId}
+              onChange={(event) => setAccountId(event.target.value)}
+              style={{ width: '100%', padding: '7px 10px', background: 'var(--color-bg)', border: '1px solid var(--color-border)', borderRadius: 4, color: 'var(--color-text)', fontSize: 12, marginBottom: 6, boxSizing: 'border-box' }}
+            >
+              {accounts.map((entry) => (
+                <option key={entry.account_id} value={entry.account_id}>
+                  {entry.account_id} ({entry.protocol})
+                </option>
+              ))}
+            </select>
+          )}
+          <button
+            onClick={() => onConnect({ config: { account_id: accountId } })}
+            disabled={loading || disabled || !ready}
+            style={{ width: '100%', padding: 8, background: loading || disabled || !ready ? 'var(--color-disabled-bg)' : 'var(--color-accent-purple)', color: 'var(--color-on-accent)', border: 'none', borderRadius: 6, fontSize: 12, cursor: loading || disabled || !ready ? 'default' : 'pointer' }}
+          >
+            {loading ? 'Connecting...' : `Connect ${displayName}`}
+          </button>
+        </div>
+      );
+    }
     if (connectorId === 'news_rss') {
       const feeds = feedUrls
         .split('\n')
@@ -506,6 +593,7 @@ const iconMap: Record<string, LucideIcon> = {
   gmail_imap: Mail,
   gmail_api: Mail,
   outlook: Mail,
+  apple_mail: Mail,
   slack: Hash,
   imessage: MessageCircle,
   whatsapp: PhoneCall,

@@ -30,7 +30,7 @@ class SimpleAgent(BaseAgent):
 
         self._emit_turn_end(content_length=len(content))
 
-        return AgentResult(content=content, turns=1)
+        return AgentResult(content=content, turns=1, metadata=result.get("usage", {}))
 
 
 __all__ = ["SimpleAgent"]

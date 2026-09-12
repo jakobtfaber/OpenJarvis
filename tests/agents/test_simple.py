@@ -30,6 +30,11 @@ class TestSimpleAgent:
         assert isinstance(result, AgentResult)
         assert result.content == "Hello there!"
         assert result.turns == 1
+        assert result.metadata == {
+            "prompt_tokens": 5,
+            "completion_tokens": 3,
+            "total_tokens": 8,
+        }
         engine.generate.assert_called_once()
 
     def test_agent_id(self):

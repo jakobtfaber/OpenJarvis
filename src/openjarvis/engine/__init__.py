@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import importlib
 
+import openjarvis.engine.claude_cli  # noqa: F401
+import openjarvis.engine.codex_cli  # noqa: F401
+
 # Import engine modules to trigger @EngineRegistry.register() decorators
 import openjarvis.engine.nim  # noqa: F401
 import openjarvis.engine.ollama  # noqa: F401
